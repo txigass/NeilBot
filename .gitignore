@@ -1,0 +1,10 @@
+.env
+vinculos.json
+dd_season.db
+*.db
+__pycache__/
+auxiliar
+auxilar2
+auxiliar3
+main - Copia.py
+main - Copia (2).py
