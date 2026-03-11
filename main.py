@@ -153,7 +153,8 @@ def dd_incrementar_usado(nick: str, season: int):
     con.close()
 
 def dd_criar_aposta(nick: str, discord_nick: str, season: int) -> int:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    from datetime import timedelta
+    ts = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M (Brasília)")
     con = sqlite3.connect(DD_DB_FILE)
     cur = con.execute(
         "INSERT INTO dd_apostas (faceit_nick, discord_nick, season, ts_aposta) VALUES (?,?,?,?)",
@@ -175,7 +176,8 @@ def dd_get_pendente(nick: str, season: int):
 
 def dd_validar_aposta(aposta_id: int, resultado: str, admin_nick: str):
     """resultado: 'vitoria' ou 'derrota'"""
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    from datetime import timedelta
+    ts = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M (Brasília)")
     if resultado == "vitoria":
         pts_base  = DD_PTS_WIN
         pts_bonus = DD_BONUS_WIN
@@ -222,6 +224,30 @@ def dd_get_relatorio_mes(season: int) -> list:
         WHERE season=? AND status='validado'
         GROUP BY faceit_nick
         ORDER BY pts_total DESC
+    """, (season,)).fetchall()
+    con.close()
+    return rows
+
+def dd_get_pendentes_todos(season: int) -> list:
+    """Retorna todos os jogadores com apostas pendentes na season."""
+    con = sqlite3.connect(DD_DB_FILE)
+    rows = con.execute("""
+        SELECT faceit_nick, discord_nick, ts_aposta, id
+        FROM dd_apostas
+        WHERE season=? AND status='pendente'
+        ORDER BY ts_aposta ASC
+    """, (season,)).fetchall()
+    con.close()
+    return rows
+
+def dd_get_pendentes_todos(season: int) -> list:
+    """Retorna todos os jogadores com apostas pendentes na season."""
+    con = sqlite3.connect(DD_DB_FILE)
+    rows = con.execute("""
+        SELECT faceit_nick, discord_nick, ts_aposta, id
+        FROM dd_apostas
+        WHERE season=? AND status='pendente'
+        ORDER BY ts_aposta ASC
     """, (season,)).fetchall()
     con.close()
     return rows
@@ -1904,6 +1930,18 @@ async def ajuda(ctx):
 # ==============================================
 # HELPER — log de ações DD para canal Discord
 # ==============================================
+def _ts_brasilia(ts_utc_str: str) -> str:
+    """Converte timestamp UTC (string ISO) para horário de Brasília (UTC-3)."""
+    try:
+        from datetime import timezone, timedelta
+        dt = datetime.fromisoformat(ts_utc_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        brt = dt.astimezone(timezone(timedelta(hours=-3)))
+        return brt.strftime("%d/%m/%Y %H:%M (BRT)")
+    except Exception:
+        return ts_utc_str
+
 async def _dd_log_canal(msg: str):
     log.info(f"[DD-LOG] {msg}")
     if DD_LOG_CHANNEL_ID:
@@ -1915,14 +1953,16 @@ async def _dd_log_canal(msg: str):
 # COMANDO !dobrar  — ativa DD antes de uma partida
 # ==============================================
 @bot.command()
-async def dobrar(ctx, nick_faceit: str = None):
-    """Jogador ativa um DD antes de jogar. Uso: !dobrar [nick_faceit]"""
-    if not nick_faceit:
-        await ctx.send("❌ Use: `!dobrar [seu_nick_faceit]`")
+async def dobrar(ctx):
+    """Jogador ativa um DD antes de jogar. Uso: !dobrar (requer vínculo)"""
+    nick = VINCULOS.get(str(ctx.author.id))
+    if not nick:
+        await ctx.send(
+            "❌ Você não tem conta Faceit vinculada.\n"
+            "Peça a um Admin para usar `!vincular @você [nick_faceit]`."
+        )
         return
-
-    nick = nick_faceit
-    discord_nick = str(ctx.author)  # ex: "txigas#1234" ou "txigas"
+    discord_nick = str(ctx.author)
 
     async with ctx.typing():
         saldo = await dd_calc_saldo(nick)
@@ -1935,8 +1975,8 @@ async def dobrar(ctx, nick_faceit: str = None):
             aposta_id, ts_ap = saldo["pendente"]
             await ctx.send(
                 f"⚠️ **{saldo['nick']}**, você já tem um DD pendente de validação!\n"
-                f"_(Ativado em {ts_ap} • ID #{aposta_id})_\n"
-                f"Aguarde o Admin validar com `!validar @você vitoria/derrota`."
+                f"_(Ativado em {_ts_brasilia(ts_ap)} • ID #{aposta_id})_\n"
+                f"Aguarde o Admin validar com `!validar {saldo['nick']} vitoria/derrota`."
             )
             return
 
@@ -2042,7 +2082,11 @@ async def validar(ctx, nick_faceit: str = None, resultado: str = None):
     embed.add_field(name="Pontos depois",   value=f"**{pts_depois} pts**",  inline=True)
     embed.add_field(name="Aposta",          value=f"#{aposta_id}",          inline=True)
     embed.set_footer(text=f"Validado por {admin_nick} • {SEASON_LABEL}")
-    await ctx.send(embed=embed)
+
+    # Menciona o jogador se tiver vínculo
+    discord_id = next((did for did, n in VINCULOS.items() if n == nick.lower()), None)
+    mention_txt = f"<@{discord_id}> " if discord_id else ""
+    await ctx.send(f"{mention_txt}", embed=embed)
 
     await _dd_log_canal(
         f"{emoji} Admin `{admin_nick}` validou DD #{aposta_id} de **{nick}** "
@@ -2054,12 +2098,19 @@ async def validar(ctx, nick_faceit: str = None, resultado: str = None):
 # COMANDO !meusdds  — jogador vê seu histórico de DDs
 # ==============================================
 @bot.command()
-async def meusdds(ctx):
-    """Mostra saldo e histórico de DDs do jogador no mês."""
-    nick = VINCULOS.get(str(ctx.author.id))
-    if not nick:
-        await ctx.send("❌ Vincule sua conta primeiro: `!vincular [nick]`")
-        return
+async def meusdds(ctx, nick_faceit: str = None):
+    """Mostra saldo e histórico de DDs. Uso: !meusdds ou !meusdds [nick] (admin)"""
+    if nick_faceit:
+        # Admin consultando qualquer jogador
+        nick = nick_faceit.lower()
+    else:
+        nick = VINCULOS.get(str(ctx.author.id))
+        if not nick:
+            await ctx.send(
+                "❌ Você não tem conta Faceit vinculada.\n"
+                "Peça a um Admin para usar `!vincular @você [nick_faceit]`."
+            )
+            return
 
     async with ctx.typing():
         saldo = await dd_calc_saldo(nick)
@@ -2082,7 +2133,7 @@ async def meusdds(ctx):
             _, ts_ap = saldo["pendente"]
             embed.add_field(
                 name="⏳ Aposta pendente",
-                value=f"Aguardando validação desde {ts_ap}",
+                value=f"Aguardando validação desde {_ts_brasilia(ts_ap)}",
                 inline=False
             )
 
@@ -2122,29 +2173,48 @@ async def meusdds(ctx):
 async def relatoriodds(ctx):
     """Admin vê relatório de todos os DDs usados na season."""
     async with ctx.typing():
-        relatorio = dd_get_relatorio_mes(SEASON)
-        if not relatorio:
-            await ctx.send("📋 Nenhum DD foi usado ainda nesta season.")
-            return
+        relatorio  = dd_get_relatorio_mes(SEASON)
+        pendentes  = dd_get_pendentes_todos(SEASON)
 
         embed = discord.Embed(
             title=f"📋 Relatório de DDs — {SEASON_LABEL}",
             color=0xFF8C00
         )
-        linhas = []
-        for nick, total, vitorias, derrotas, pts_base, pts_bonus, pts_total in relatorio:
-            emoji = "🟢" if pts_total >= 0 else "🔴"
-            v_txt = f"{vitorias}V" if vitorias else ""
-            d_txt = f"{derrotas}D" if derrotas else ""
-            placar = " / ".join(filter(None, [v_txt, d_txt])) or "—"
-            linhas.append(
-                f"{emoji} **{nick}** — {placar} → **{pts_total:+} pts** "
-                f"_(base {pts_base:+} + bônus {pts_bonus:+})_"
+
+        # Seção pendentes
+        if pendentes:
+            linhas_pend = []
+            for nick, discord_nick, ts_ap, aposta_id in pendentes:
+                linhas_pend.append(f"⏳ **{nick}** — ativado em {_ts_brasilia(ts_ap)} _(#{aposta_id})_")
+            embed.add_field(
+                name=f"⚠️ Aguardando validação ({len(pendentes)})",
+                value="\n".join(linhas_pend),
+                inline=False
             )
 
-        embed.description = "\n".join(linhas)
-        total_geral = sum(r[6] for r in relatorio)
-        embed.set_footer(text=f"Total de jogadores: {len(relatorio)} • {SEASON_LABEL}")
+        # Seção validados
+        if relatorio:
+            linhas = []
+            for nick, total, vitorias, derrotas, pts_base, pts_bonus, pts_total in relatorio:
+                emoji = "🟢" if pts_total >= 0 else "🔴"
+                v_txt = f"{vitorias}V" if vitorias else ""
+                d_txt = f"{derrotas}D" if derrotas else ""
+                placar = " / ".join(filter(None, [v_txt, d_txt])) or "—"
+                linhas.append(
+                    f"{emoji} **{nick}** — {placar} → **{pts_total:+} pts** "
+                    f"_(base {pts_base:+} + bônus {pts_bonus:+})_"
+                )
+            embed.add_field(
+                name=f"✅ Validados ({len(relatorio)})",
+                value="\n".join(linhas),
+                inline=False
+            )
+
+        if not relatorio and not pendentes:
+            await ctx.send("📋 Nenhum DD foi usado ainda nesta season.")
+            return
+
+        embed.set_footer(text=f"Pendentes: {len(pendentes)} • Validados: {len(relatorio)} • {SEASON_LABEL}")
         await ctx.send(embed=embed)
 # ==============================================
 # COMANDO !vincular @usuario [nick_faceit]  — Admin
