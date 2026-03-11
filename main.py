@@ -53,8 +53,6 @@ import hmac
 import hashlib
 import sqlite3
 
-VINCULOS_FILE = "vinculos.json"
-
 # ==============================================
 # CONFIG — Double Down (DD)
 # ==============================================
@@ -64,19 +62,51 @@ DD_MAX            = 5     # teto de DDs por season
 DD_DB_FILE        = "dd_season.db"
 
 def load_vinculos() -> dict:
-    """Carrega mapeamento {discord_id: faceit_nick} do disco."""
-    try:
-        with open(VINCULOS_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """Carrega vínculos do SQLite para memória."""
+    con = sqlite3.connect(DD_DB_FILE)
+    rows = con.execute("SELECT discord_id, faceit_nick FROM vinculos").fetchall()
+    con.close()
+    return {row[0]: row[1] for row in rows}
 
 def save_vinculos(data: dict):
-    with open(VINCULOS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    """Não utilizado — vínculos são salvos diretamente no SQLite."""
+    pass
 
-# {discord_id_str: faceit_nick_lower}
-VINCULOS: dict = load_vinculos()
+def vinculos_add(discord_id: str, faceit_nick: str):
+    con = sqlite3.connect(DD_DB_FILE)
+    con.execute("""
+        INSERT INTO vinculos (discord_id, faceit_nick) VALUES (?,?)
+        ON CONFLICT(discord_id) DO UPDATE SET faceit_nick=excluded.faceit_nick
+    """, (discord_id, faceit_nick.lower()))
+    con.commit()
+    con.close()
+
+def vinculos_remove(discord_id: str):
+    con = sqlite3.connect(DD_DB_FILE)
+    con.execute("DELETE FROM vinculos WHERE discord_id=?", (discord_id,))
+    con.commit()
+    con.close()
+
+def vinculos_get_nick(discord_id: str) -> str | None:
+    con = sqlite3.connect(DD_DB_FILE)
+    row = con.execute("SELECT faceit_nick FROM vinculos WHERE discord_id=?", (discord_id,)).fetchone()
+    con.close()
+    return row[0] if row else None
+
+def vinculos_get_discord_id(faceit_nick: str) -> str | None:
+    con = sqlite3.connect(DD_DB_FILE)
+    row = con.execute("SELECT discord_id FROM vinculos WHERE faceit_nick=?", (faceit_nick.lower(),)).fetchone()
+    con.close()
+    return row[0] if row else None
+
+def vinculos_get_all() -> dict:
+    con = sqlite3.connect(DD_DB_FILE)
+    rows = con.execute("SELECT discord_id, faceit_nick FROM vinculos").fetchall()
+    con.close()
+    return {row[0]: row[1] for row in rows}
+
+# {discord_id_str: faceit_nick_lower} — carregado após dd_init_db()
+VINCULOS: dict = {}
 
 # Partidas ativas: {match_id: {"category": category_id, "ch1": ch1_id, "ch2": ch2_id}}
 ACTIVE_MATCHES: dict = {}
@@ -125,6 +155,13 @@ def dd_init_db():
             admin_nick   TEXT
         )
     """)
+    # Tabela de vínculos Discord ↔ Faceit
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS vinculos (
+            discord_id  TEXT PRIMARY KEY,
+            faceit_nick TEXT NOT NULL
+        )
+    """)
     # Migração: adiciona coluna se não existir (compatibilidade com DB antigo)
     try:
         con.execute("ALTER TABLE dd_apostas ADD COLUMN discord_nick TEXT NOT NULL DEFAULT ''")
@@ -133,6 +170,27 @@ def dd_init_db():
         pass
     con.commit()
     con.close()
+
+    # Migração: importa vinculos.json para o SQLite (só na primeira vez)
+    import os as _os
+    if _os.path.exists("vinculos.json"):
+        try:
+            import json as _json
+            with open("vinculos.json") as _f:
+                _data = _json.load(_f)
+            if _data:
+                _con = sqlite3.connect(DD_DB_FILE)
+                for _did, _nick in _data.items():
+                    _con.execute("""
+                        INSERT INTO vinculos (discord_id, faceit_nick) VALUES (?,?)
+                        ON CONFLICT(discord_id) DO NOTHING
+                    """, (_did, _nick.lower()))
+                _con.commit()
+                _con.close()
+                log.info(f"[VINCULOS] Migrados {len(_data)} vínculos do JSON para o SQLite.")
+                _os.rename("vinculos.json", "vinculos.json.bak")
+        except Exception as _e:
+            log.warning(f"[VINCULOS] Falha na migração do JSON: {_e}")
 
 def dd_get_usados(nick: str, season: int) -> int:
     con = sqlite3.connect(DD_DB_FILE)
@@ -2084,7 +2142,7 @@ async def validar(ctx, nick_faceit: str = None, resultado: str = None):
     embed.set_footer(text=f"Validado por {admin_nick} • {SEASON_LABEL}")
 
     # Menciona o jogador se tiver vínculo
-    discord_id = next((did for did, n in VINCULOS.items() if n == nick.lower()), None)
+    discord_id = vinculos_get_discord_id(nick)
     mention_txt = f"<@{discord_id}> " if discord_id else ""
     await ctx.send(f"{mention_txt}", embed=embed)
 
@@ -2234,8 +2292,8 @@ async def vincular(ctx, membro: discord.Member = None, nick_faceit: str = None):
             return
 
         nick_real = player.get("nickname", nick_faceit)
+        vinculos_add(str(membro.id), nick_real)
         VINCULOS[str(membro.id)] = nick_real.lower()
-        save_vinculos(VINCULOS)
 
         embed = discord.Embed(
             title="✅ Vínculo criado!",
@@ -2261,7 +2319,7 @@ async def desvincular(ctx, membro: discord.Member = None):
         return
 
     nick = VINCULOS.pop(discord_id)
-    save_vinculos(VINCULOS)
+    vinculos_remove(discord_id)
     await ctx.send(f"✅ Vínculo de {membro.mention} com **{nick}** removido.")
 
 @bot.command()
@@ -2344,10 +2402,11 @@ async def on_message(message):
 # ==============================================
 @bot.event
 async def on_ready():
-    global session
+    global session, VINCULOS
     session = aiohttp.ClientSession()
     dd_init_db()
-    log.info(f"✅ Bot conectado como {bot.user}")
+    VINCULOS = load_vinculos()
+    log.info(f"✅ Bot conectado como {bot.user} — {len(VINCULOS)} vínculos carregados")
     if not FACEIT_SESSION_COOKIE:
         log.warning("⚠️ FACEIT_SESSION_COOKIE nao configurado! Leaderboard nao funcionara.")
 
